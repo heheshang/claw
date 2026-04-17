@@ -18,8 +18,9 @@ dist-ssr
 .claw/settings.local.json
 
 # Editor directories and files
-.vscode/*
+.vscode/
 !.vscode/extensions.json
+.omc/
 .idea
 .DS_Store
 *.suo
