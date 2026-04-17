@@ -44,7 +44,6 @@ target/
 Cargo.lock
 
 # Node
-package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
