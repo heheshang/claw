@@ -1,4 +1,4 @@
-name: Build and Release
+name: Build
 
 on:
   push:
@@ -11,15 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: 'macos-latest'
-            args: '--target aarch64-apple-darwin'
-          - platform: 'macos-latest'
-            args: '--target x86_64-apple-darwin'
-          - platform: 'ubuntu-22.04'
-            args: ''
-          - platform: 'windows-latest'
-            args: ''
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
 
     runs-on: ${{ matrix.platform }}
 
@@ -28,9 +20,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && contains(matrix.args, 'aarch64') && 'aarch64-apple-darwin' || '' }}
+        if: matrix.platform != 'ubuntu-22.04'
+        run: rustup target add ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -38,52 +29,21 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install frontend dependencies
+      - name: Install dependencies
         run: npm install
 
-      - name: Build Tauri app
+      - name: Build Tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: ${{ matrix.args }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
-        if: matrix.platform == 'ubuntu-22.04'
         with:
-          name: tauri-app-ubuntu
-          path: src-tauri/target/release/bundle/deb/*.deb
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v4
-        if: matrix.platform == 'macos-latest'
-        with:
-          name: tauri-app-macos
-          path: src-tauri/target/*/bundle/*/*.app
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        if: matrix.platform == 'windows-latest'
-        with:
-          name: tauri-app-windows
-          path: src-tauri/target/release/bundle/msi/*.msi
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            tauri-app-ubuntu/*.deb
-            tauri-app-macos/*.app
-            tauri-app-windows/*.msi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: app-${{ matrix.platform }}
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/app/*.app
+          retention-days: 7
