@@ -13,6 +13,8 @@ dist-ssr
 *.local
 
 # Claw config (contains API keys)
+.claw/
+.claw_bk/
 .claw/settings.local.json
 
 # Editor directories and files
