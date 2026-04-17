@@ -76,16 +76,11 @@ jobs:
           echo "tag=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Create tag
-        uses: actions/github-script@v7
-        with:
-          script: |
-            github.rest.git.createTag({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag: '${{ steps.version.outputs.tag }}',
-              message: 'Release ${{ steps.version.outputs.tag }}',
-              type: 'commit'
-            })
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git tag $TAG
+          git push origin $TAG
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
