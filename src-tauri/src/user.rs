@@ -245,6 +245,28 @@ pub fn init_db() -> SqliteResult<Connection> {
         let _ = conn.execute(sql, []);
     }
 
+    // Create api_configs table for user-level API configuration
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS api_configs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            api_key TEXT,
+            base_url TEXT,
+            model TEXT,
+            max_tokens INTEGER,
+            temperature REAL,
+            retry_count INTEGER,
+            response_language TEXT,
+            is_active INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, provider)
+        )",
+        [],
+    )?;
+
     Ok(conn)
 }
 
@@ -606,4 +628,101 @@ pub async fn invoke_llm(request: ChatRequest) -> Result<String, String> {
 
     info!("[LLM] Response received, {} chars", text.len());
     Ok(text)
+}
+
+// ============================================================================
+// API Config Database Operations
+// ============================================================================
+
+use crate::ApiConfig;
+
+/// Get user ID by username
+pub fn get_user_id_by_username(db: &Connection, username: &str) -> SqliteResult<Option<i64>> {
+    let mut stmt = db.prepare("SELECT id FROM users WHERE username = ?1")?;
+    let result = stmt.query_row([username], |row| row.get(0));
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Get API config for a user and provider
+pub fn get_api_config(db: &Connection, user_id: i64, provider: &str) -> SqliteResult<Option<ApiConfig>> {
+    let mut stmt = db.prepare(
+        "SELECT provider, api_key, base_url, model, max_tokens, temperature, retry_count, response_language
+         FROM api_configs WHERE user_id = ?1 AND provider = ?2"
+    )?;
+
+    let result = stmt.query_row([user_id.to_string(), provider.to_string()], |row| {
+        Ok(ApiConfig {
+            provider: row.get(0)?,
+            api_key: row.get(1)?,
+            base_url: row.get(2)?,
+            model: row.get(3)?,
+            max_tokens: row.get(4)?,
+            temperature: row.get(5)?,
+            retry_count: row.get(6)?,
+            response_language: row.get(7)?,
+        })
+    });
+
+    match result {
+        Ok(config) => Ok(Some(config)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Save or update API config for a user
+pub fn save_api_config(db: &Connection, user_id: i64, config: &ApiConfig) -> SqliteResult<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Try to update existing config first
+    let updated = db.execute(
+        "UPDATE api_configs SET
+            api_key = ?1,
+            base_url = ?2,
+            model = ?3,
+            max_tokens = ?4,
+            temperature = ?5,
+            retry_count = ?6,
+            response_language = ?7,
+            updated_at = ?8
+         WHERE user_id = ?9 AND provider = ?10",
+        (
+            &config.api_key,
+            &config.base_url,
+            &config.model,
+            &config.max_tokens,
+            &config.temperature,
+            &config.retry_count,
+            &config.response_language,
+            &now,
+            &user_id.to_string(),
+            &config.provider,
+        ),
+    )?;
+
+    // If no existing config, insert new one
+    if updated == 0 {
+        db.execute(
+            "INSERT INTO api_configs (user_id, provider, api_key, base_url, model, max_tokens, temperature, retry_count, response_language, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            (
+                &user_id.to_string(),
+                &config.provider,
+                &config.api_key,
+                &config.base_url,
+                &config.model,
+                &config.max_tokens,
+                &config.temperature,
+                &config.retry_count,
+                &config.response_language,
+                &now,
+            ),
+        )?;
+    }
+
+    Ok(())
 }

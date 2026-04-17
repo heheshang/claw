@@ -129,7 +129,15 @@ async function loadProfile() {
 async function loadApiConfig() {
   apiLoading.value = true
   try {
-    const config = await invoke<ApiConfig>('harness_get_api_config')
+    const userStr = localStorage.getItem('user')
+    if (!userStr) {
+      throw new Error('No user session')
+    }
+    const user = JSON.parse(userStr)
+    const config = await invoke<ApiConfig>('harness_get_api_config', {
+      username: user.username,
+      provider: apiConfig.value.provider
+    })
     apiConfig.value = {
       provider: config.provider,
       api_key: config.api_key || '',
@@ -233,7 +241,13 @@ async function saveApiConfig() {
   apiMessage.value = { type: '', text: '' }
 
   try {
+    const userStr = localStorage.getItem('user')
+    if (!userStr) {
+      throw new Error('No user session')
+    }
+    const user = JSON.parse(userStr)
     await invoke('harness_save_api_config', {
+      username: user.username,
       config: {
         provider: apiConfig.value.provider,
         api_key: apiConfig.value.api_key || null,

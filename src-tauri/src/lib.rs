@@ -3,15 +3,32 @@ mod user;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use log::warn;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use harness::{HarnessState, get_tool_definitions, get_help_text, parse_slash_command, build_system_prompt, PermissionLevel, tool_definitions_with_permissions};
-use user::{init_db, AppState, register, login, verify_token, get_user_profile, update_user_profile, change_password, invoke_llm, get_model};
+use user::{init_db, AppState, register, login, verify_token, get_user_profile, update_user_profile, change_password, invoke_llm, get_model, get_api_config, save_api_config, get_user_id_by_username};
 
 // Re-export types for testing
 pub use harness::{Session, SessionManager, ConversationMessage, MessageRole, ContentBlock, ApiMessage, LlmConfig, LlmProvider, ApiClient, Config, ProviderSettings, ToolExecutor, PermissionedToolExecutor};
 pub use harness::runtime::MessageContent as HarnessMessageContent;
 pub use harness::api::resolve_model_alias;
+
+// ============================================================================
+// API Configuration Structure (defined early for user module access)
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApiConfig {
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f64>,
+    pub retry_count: Option<u32>,
+    pub response_language: Option<String>,
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -52,6 +69,9 @@ pub fn run() {
             harness_set_permission,
             harness_get_api_config,
             harness_save_api_config,
+            search_files,
+            harness_read_file,
+            harness_read_directory,
             harness_get_session_list,
             harness_load_session,
             harness_create_session,
@@ -144,65 +164,235 @@ fn harness_get_help() -> Result<String, String> {
 }
 
 // ============================================================================
-// API Configuration Commands
+// File Search Commands
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ApiConfig {
-    pub provider: String,
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-    pub max_tokens: Option<u32>,
-    pub temperature: Option<f64>,
-    pub retry_count: Option<u32>,
-    pub response_language: Option<String>,
+#[derive(Debug, Serialize)]
+pub struct FileInfo {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
 }
 
 #[tauri::command]
-fn harness_get_api_config(state: tauri::State<'_, HarnessState>) -> Result<ApiConfig, String> {
-    let config = state.config.read().map_err(|e| e.to_string())?;
-    let model = config.get_model("anthropic", "claude-sonnet-4-20250514");
+fn search_files(pattern: String, workspace_root: String) -> Result<Vec<FileInfo>, String> {
+    let root = PathBuf::from(workspace_root);
+    let pattern_lower = pattern.to_lowercase();
 
+    let mut results = Vec::new();
+
+    fn walk_dir(dir: &PathBuf, pattern: &str, results: &mut Vec<FileInfo>, root: &PathBuf, depth: usize) {
+        if depth > 3 {
+            return;
+        }
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files and common ignore patterns
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+
+            let is_dir = path.is_dir();
+
+            // Check if name matches pattern (case insensitive)
+            if name.to_lowercase().contains(pattern) {
+                let relative_path = path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+
+                results.push(FileInfo {
+                    path: relative_path,
+                    name,
+                    is_dir,
+                    size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+                });
+            }
+
+            // Recurse into directories
+            if is_dir {
+                walk_dir(&path, pattern, results, root, depth + 1);
+            }
+        }
+    }
+
+    walk_dir(&root, &pattern_lower, &mut results, &root, 0);
+
+    // Sort: directories first, then by name
+    results.sort_by(|a, b| {
+        match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    // Limit results
+    results.truncate(50);
+
+    Ok(results)
+}
+
+#[tauri::command]
+fn harness_read_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read file '{}': {}", path, e))
+}
+
+#[tauri::command]
+fn harness_read_directory(path: String, extensions: Vec<String>) -> Result<Vec<FileInfo>, String> {
+    let root = PathBuf::from(&path);
+    let mut results = Vec::new();
+
+    fn walk_dir(dir: &PathBuf, extensions: &[String], results: &mut Vec<FileInfo>, depth: usize) {
+        if depth > 4 {
+            return;
+        }
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files and common ignore patterns
+            if name.starts_with('.') || name == "node_modules" || name == "target" || name == "dist" {
+                continue;
+            }
+
+            let is_dir = path.is_dir();
+
+            if is_dir {
+                walk_dir(&path, extensions, results, depth + 1);
+            } else {
+                // Check file extension
+                let ext = path.extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                if extensions.is_empty() || extensions.contains(&ext) {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        // Skip very large files
+                        if content.len() > 50000 {
+                            continue;
+                        }
+
+                        let relative_path = path.to_string_lossy().to_string();
+                        results.push(FileInfo {
+                            path: relative_path,
+                            name,
+                            is_dir: false,
+                            size: entry.metadata().map(|m| m.len()).unwrap_or(0) as u64,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    walk_dir(&root, &extensions, &mut results, 0);
+
+    // Sort by path
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(results)
+}
+
+// ============================================================================
+// API Configuration Commands
+// ============================================================================
+
+#[tauri::command]
+fn harness_get_api_config(
+    state: tauri::State<'_, AppState>,
+    username: String,
+    provider: String,
+) -> Result<ApiConfig, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+
+    // Get user_id from username
+    let user_id = get_user_id_by_username(&db, &username)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "User not found".to_string())?;
+
+    // Try to get config from database first
+    match get_api_config(&db, user_id, &provider) {
+        Ok(Some(config)) => return Ok(config),
+        Ok(None) => {} // Fall through to global config
+        Err(e) => warn!("Failed to get API config from DB: {}", e),
+    }
+
+    // Fallback to global config from HarnessState (for backward compatibility)
+    // This requires accessing HarnessState, which we can't do directly here
+    // So we return default values with the provider
     Ok(ApiConfig {
-        provider: "anthropic".to_string(),
-        api_key: config.providers.anthropic.api_key.clone(),
-        base_url: config.providers.anthropic.base_url.clone(),
-        model: Some(model),
-        max_tokens: config.providers.anthropic.max_tokens,
-        temperature: config.providers.anthropic.temperature,
-        retry_count: config.providers.anthropic.retry_count,
-        response_language: config.providers.anthropic.response_language.clone(),
+        provider: provider.clone(),
+        api_key: None,
+        base_url: None,
+        model: None,
+        max_tokens: None,
+        temperature: None,
+        retry_count: None,
+        response_language: None,
     })
 }
 
 #[tauri::command]
-fn harness_save_api_config(state: tauri::State<'_, HarnessState>, config: ApiConfig) -> Result<(), String> {
-    let mut cfg = state.config.write().map_err(|e| e.to_string())?;
+fn harness_save_api_config(
+    app_state: tauri::State<'_, AppState>,
+    harness_state: tauri::State<'_, HarnessState>,
+    username: String,
+    config: ApiConfig,
+) -> Result<(), String> {
+    let db = app_state.db.lock().map_err(|e| e.to_string())?;
+
+    // Get user_id from username
+    let user_id = get_user_id_by_username(&db, &username)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "User not found".to_string())?;
+
+    // Save to database
+    save_api_config(&db, user_id, &config)
+        .map_err(|e| e.to_string())?;
+
+    // Also update global config in HarnessState for immediate effect
+    let mut cfg = harness_state.config.write().map_err(|e| e.to_string())?;
 
     match config.provider.as_str() {
         "anthropic" => {
-            cfg.providers.anthropic.api_key = config.api_key;
-            cfg.providers.anthropic.base_url = config.base_url;
-            cfg.providers.anthropic.model = config.model;
+            cfg.providers.anthropic.api_key = config.api_key.clone();
+            cfg.providers.anthropic.base_url = config.base_url.clone();
+            cfg.providers.anthropic.model = config.model.clone();
             cfg.providers.anthropic.max_tokens = config.max_tokens;
             cfg.providers.anthropic.temperature = config.temperature;
             cfg.providers.anthropic.retry_count = config.retry_count;
             cfg.providers.anthropic.response_language = config.response_language.clone();
         }
         "openai" => {
-            cfg.providers.openai.api_key = config.api_key;
-            cfg.providers.openai.base_url = config.base_url;
-            cfg.providers.openai.model = config.model;
+            cfg.providers.openai.api_key = config.api_key.clone();
+            cfg.providers.openai.base_url = config.base_url.clone();
+            cfg.providers.openai.model = config.model.clone();
             cfg.providers.openai.max_tokens = config.max_tokens;
             cfg.providers.openai.temperature = config.temperature;
             cfg.providers.openai.retry_count = config.retry_count;
             cfg.providers.openai.response_language = config.response_language.clone();
         }
         "xai" => {
-            cfg.providers.xai.api_key = config.api_key;
-            cfg.providers.xai.base_url = config.base_url;
-            cfg.providers.xai.model = config.model;
+            cfg.providers.xai.api_key = config.api_key.clone();
+            cfg.providers.xai.base_url = config.base_url.clone();
+            cfg.providers.xai.model = config.model.clone();
             cfg.providers.xai.max_tokens = config.max_tokens;
             cfg.providers.xai.temperature = config.temperature;
             cfg.providers.xai.retry_count = config.retry_count;
@@ -210,18 +400,6 @@ fn harness_save_api_config(state: tauri::State<'_, HarnessState>, config: ApiCon
         }
         _ => return Err(format!("Unknown provider: {}", config.provider)),
     }
-
-    // Save to local file
-    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let local_path = workspace_root.join(".claw").join("settings.local.json");
-
-    if let Some(parent) = local_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // Serialize and save
-    let json = serde_json::to_string_pretty(&*cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&local_path, json).map_err(|e| e.to_string())?;
 
     // Update API client if key changed
     if let Some(api_key) = cfg.providers.anthropic.api_key.clone() {
@@ -242,8 +420,19 @@ fn harness_save_api_config(state: tauri::State<'_, HarnessState>, config: ApiCon
         };
 
         let api_client = harness::ApiClient::new(llm_config);
-        *state.api_client.lock().map_err(|e| e.to_string())? = Some(api_client);
+        *harness_state.api_client.lock().map_err(|e| e.to_string())? = Some(api_client);
     }
+
+    // Save to local file for persistence
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let local_path = workspace_root.join(".claw").join("settings.local.json");
+
+    if let Some(parent) = local_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let json = serde_json::to_string_pretty(&*cfg).map_err(|e| e.to_string())?;
+    std::fs::write(&local_path, json).map_err(|e| e.to_string())?;
 
     Ok(())
 }

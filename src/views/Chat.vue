@@ -51,10 +51,30 @@ interface ToolDefinition {
   input_schema: any
 }
 
+interface UploadedFile {
+  name: string
+  content: string
+  type: string
+  size: number
+}
+
+interface FileReference {
+  name: string
+  path: string
+  content: string
+}
+
 interface ToolCategory {
   name: string
   icon: string
   tools: string[]
+}
+
+interface FileInfo {
+  path: string
+  name: string
+  is_dir: boolean
+  size: number
 }
 
 const toolCategories: ToolCategory[] = [
@@ -89,6 +109,27 @@ const inputRef = ref<HTMLInputElement | null>(null)
 const streamingContent = ref('')
 const currentStreamingMessageId = ref<string | null>(null)
 
+// File upload
+const uploadedFiles = ref<UploadedFile[]>([])
+const isDragging = ref(false)
+const fileInputRef = ref<HTMLInputElement | null>(null)
+const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
+
+// File reference (@ mention)
+const showFilePicker = ref(false)
+const fileSearchQuery = ref('')
+const fileSearchResults = ref<FileInfo[]>([])
+const fileReferences = ref<FileReference[]>([])
+// const filePickerPosition = ref({ top: 0, left: 0 }) // Reserved for future positioning
+const fileSearchInputRef = ref<HTMLInputElement | null>(null)
+const selectedFileIndex = ref(0)
+const atTriggerPos = ref(0)
+const isLoadingFiles = ref(false)
+
+// Multiline input (reserved for future implementation)
+// const multilineMode = ref(false)
+// const multilineContent = ref('')
+
 const permissionLevels = [
   { value: 'readonly', label: '只读', tools: ['read', 'glob', 'grep', 'lspath'] },
   { value: 'workspacewrite', label: '可写', tools: ['read', 'write', 'edit', 'glob', 'grep', 'lspath', 'git_status', 'git_log', 'git_branch'] },
@@ -100,7 +141,7 @@ const currentTools = computed(() => {
   return level?.tools || []
 })
 
-const canSend = computed(() => inputMessage.value.trim() && !isLoading.value)
+const canSend = computed(() => (inputMessage.value.trim() || uploadedFiles.value.length > 0) && !isLoading.value)
 
 const availableToolCategories = computed(() => {
   return toolCategories.filter(cat =>
@@ -174,19 +215,50 @@ async function sendMessage() {
   if (!canSend.value) return
 
   const userMessage = inputMessage.value.trim()
-  if (!userMessage) return
+  if (!userMessage && uploadedFiles.value.length === 0 && fileReferences.value.length === 0) return
+
+  // Build message content including uploaded files and file references
+  let fullMessage = userMessage
+
+  // Add file references
+  if (fileReferences.value.length > 0) {
+    const refContents = fileReferences.value.map(f => {
+      return `\`\`\`${f.path}\n${f.content}\n\`\`\``
+    }).join('\n\n')
+    fullMessage = fullMessage
+      ? `${userMessage}\n\n引用文件：\n\n${refContents}`
+      : `请分析以下引用文件：\n\n${refContents}`
+  }
+
+  // Add uploaded files
+  if (uploadedFiles.value.length > 0) {
+    const fileContents = uploadedFiles.value.map(f => {
+      return `\`\`\`${f.name}\n${f.content}\n\`\`\``
+    }).join('\n\n')
+    fullMessage = fullMessage
+      ? `${fullMessage}\n\n上传的文件：\n\n${fileContents}`
+      : `请分析以下文件内容：\n\n${fileContents}`
+  }
+
+  // Clear file references
+  fileReferences.value = []
 
   // Add to history
-  inputHistory.value.push(userMessage)
-  historyIndex.value = -1
+  if (userMessage) {
+    inputHistory.value.push(userMessage)
+    historyIndex.value = -1
+  }
 
   inputMessage.value = ''
   showCompletion.value = false
 
+  // Clear uploaded files after adding to message
+  uploadedFiles.value = []
+
   messages.value.push({
     id: `user-${Date.now()}`,
     role: 'user',
-    content: userMessage,
+    content: fullMessage,
     timestamp: new Date()
   })
 
@@ -344,6 +416,12 @@ async function sendMessage() {
 }
 
 function handleKeydown(e: KeyboardEvent) {
+  // Handle file picker navigation first
+  if (showFilePicker.value) {
+    handleFilePickerKeydown(e)
+    return
+  }
+
   // Tab completion
   if (e.key === 'Tab' && showCompletion.value && completions.value.length > 0) {
     e.preventDefault()
@@ -412,6 +490,26 @@ function handleKeydown(e: KeyboardEvent) {
 function handleInput() {
   const input = inputMessage.value
 
+  // Check for @ file reference
+  const atIndex = input.lastIndexOf('@')
+  if (atIndex !== -1 && (atIndex === 0 || /\s/.test(input[atIndex - 1]))) {
+    // Check if there's no space after @ or if @ is at start/in a new "word"
+    const afterAt = input.slice(atIndex + 1)
+    if (!afterAt.includes(' ') && !showFilePicker.value) {
+      // Trigger file picker
+      fileSearchQuery.value = afterAt
+      atTriggerPos.value = atIndex
+      openFilePicker()
+      searchFiles(afterAt)
+      return
+    }
+  }
+
+  if (showFilePicker.value && !input.slice(atTriggerPos.value).startsWith('@')) {
+    showFilePicker.value = false
+    fileSearchQuery.value = ''
+  }
+
   // Check for slash command or tool completion
   if (input.startsWith('/')) {
     const prefix = input.toLowerCase()
@@ -437,6 +535,120 @@ function handleInput() {
     }
   } else {
     showCompletion.value = false
+  }
+}
+
+// File reference functions
+async function searchFiles(query: string) {
+  if (!query) {
+    fileSearchResults.value = []
+    return
+  }
+  try {
+    const results = await invoke<FileInfo[]>('search_files', {
+      pattern: query,
+      workspaceRoot: '.'
+    })
+    fileSearchResults.value = results
+  } catch (e) {
+    warn('File search failed', { error: e })
+    fileSearchResults.value = []
+  }
+}
+
+function openFilePicker() {
+  showFilePicker.value = true
+  fileSearchQuery.value = ''
+  fileSearchResults.value = []
+  selectedFileIndex.value = 0
+  // Reset input to remove partial @query
+  inputMessage.value = inputMessage.value.slice(0, atTriggerPos.value)
+  nextTick(() => {
+    fileSearchInputRef.value?.focus()
+  })
+}
+
+async function insertFileReference(file: FileInfo) {
+  // For folders, recursively read all code files
+  if (file.is_dir) {
+    isLoadingFiles.value = true
+    showFilePicker.value = false
+
+    try {
+      // Get all code files in the directory
+      const files = await invoke<FileInfo[]>('harness_read_directory', {
+        path: file.path,
+        extensions: ['ts', 'tsx', 'js', 'jsx', 'vue', 'rs', 'py', 'go', 'java', 'cpp', 'c', 'h', 'css', 'scss', 'json', 'yaml', 'yml', 'toml', 'md', 'txt']
+      })
+
+      // Read content of each file
+      for (const f of files) {
+        try {
+          const content = await invoke<string>('harness_read_file', { path: f.path })
+          fileReferences.value.push({
+            name: f.name,
+            path: f.path,
+            content: content
+          })
+        } catch (e) {
+          warn('Failed to read file', { path: f.path, error: e })
+        }
+      }
+
+      info('Loaded files from directory', { count: files.length })
+    } catch (e) {
+      warn('Failed to read directory', { error: e })
+    } finally {
+      isLoadingFiles.value = false
+    }
+
+    // Clear the @query from input
+    const beforeAt = inputMessage.value.slice(0, atTriggerPos.value)
+    inputMessage.value = beforeAt
+    inputRef.value?.focus()
+    return
+  }
+
+  try {
+    // Read file content
+    const content = await invoke<string>('harness_read_file', { path: file.path })
+
+    // Add to file references
+    fileReferences.value.push({
+      name: file.name,
+      path: file.path,
+      content: content
+    })
+
+    // Replace @query with @filename in input
+    const beforeAt = inputMessage.value.slice(0, atTriggerPos.value)
+    const afterQuery = inputMessage.value.slice(atTriggerPos.value + fileSearchQuery.value.length + 1)
+    inputMessage.value = beforeAt + '@' + file.name + afterQuery
+
+    // Close file picker
+    showFilePicker.value = false
+    fileSearchQuery.value = ''
+    fileSearchResults.value = []
+  } catch (e) {
+    warn('Failed to read file', { error: e })
+  }
+}
+
+function handleFilePickerKeydown(e: KeyboardEvent) {
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    selectedFileIndex.value = Math.min(selectedFileIndex.value + 1, fileSearchResults.value.length - 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    selectedFileIndex.value = Math.max(selectedFileIndex.value - 1, 0)
+  } else if (e.key === 'Enter') {
+    e.preventDefault()
+    if (fileSearchResults.value[selectedFileIndex.value]) {
+      insertFileReference(fileSearchResults.value[selectedFileIndex.value])
+    }
+  } else if (e.key === 'Escape') {
+    showFilePicker.value = false
+    fileSearchQuery.value = ''
   }
 }
 
@@ -603,6 +815,76 @@ function getToolStatusIcon(status: string): string {
     default: return '❓'
   }
 }
+
+// File upload handlers
+function triggerFileUpload() {
+  fileInputRef.value?.click()
+}
+
+function handleFileInput(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (input.files) {
+    handleFiles(Array.from(input.files))
+  }
+  input.value = '' // Reset input
+}
+
+function handleFiles(files: File[]) {
+  for (const file of files) {
+    if (file.size > MAX_FILE_SIZE) {
+      warn(`File too large: ${file.name} (max ${MAX_FILE_SIZE / 1024 / 1024}MB)`)
+      continue
+    }
+    readFileContent(file).then(content => {
+      uploadedFiles.value.push({
+        name: file.name,
+        content,
+        type: file.type,
+        size: file.size
+      })
+    })
+  }
+}
+
+async function readFileContent(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      resolve(result)
+    }
+    reader.onerror = () => reject(reader.error)
+    reader.readAsText(file)
+  })
+}
+
+function removeFile(index: number) {
+  uploadedFiles.value.splice(index, 1)
+}
+
+function handleDragOver(e: DragEvent) {
+  e.preventDefault()
+  isDragging.value = true
+}
+
+function handleDragLeave(e: DragEvent) {
+  e.preventDefault()
+  isDragging.value = false
+}
+
+function handleDrop(e: DragEvent) {
+  e.preventDefault()
+  isDragging.value = false
+  if (e.dataTransfer?.files) {
+    handleFiles(Array.from(e.dataTransfer.files))
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+}
 </script>
 
 <template>
@@ -761,9 +1043,91 @@ function getToolStatusIcon(status: string): string {
       </div>
     </div>
 
+    <!-- File Picker Popup -->
+    <div v-if="showFilePicker" class="file-picker-popup">
+      <div class="file-picker-header">
+        <span class="file-picker-icon">📄</span>
+        <span>引用文件</span>
+      </div>
+      <div class="file-search-input-wrapper">
+        <input
+          ref="fileSearchInputRef"
+          v-model="fileSearchQuery"
+          type="text"
+          placeholder="搜索文件..."
+          class="file-search-input"
+          @input="searchFiles(fileSearchQuery)"
+          @keydown="handleFilePickerKeydown"
+          autofocus
+        />
+      </div>
+      <div class="file-search-results">
+        <div
+          v-for="(file, index) in fileSearchResults"
+          :key="file.path"
+          :class="['file-search-item', { selected: index === selectedFileIndex }]"
+          @click="insertFileReference(file)"
+          @mouseenter="selectedFileIndex = index"
+        >
+          <span class="file-item-icon">{{ file.is_dir ? '📁' : '📄' }}</span>
+          <span class="file-item-name">{{ file.name }}</span>
+          <span class="file-item-path">{{ file.path }}</span>
+        </div>
+        <div v-if="fileSearchResults.length === 0" class="file-search-empty">
+          {{ fileSearchQuery ? '未找到文件' : '输入文件名搜索' }}
+        </div>
+      </div>
+    </div>
+
+    <!-- Drag overlay -->
+    <div
+      v-if="isDragging"
+      class="drag-overlay"
+      @dragover="handleDragOver"
+      @dragleave="handleDragLeave"
+      @drop="handleDrop"
+    >
+      <div class="drag-content">
+        <span class="drag-icon">📄</span>
+        <span class="drag-text">拖放文件到此处上传</span>
+      </div>
+    </div>
+
     <!-- Footer -->
     <footer class="chat-footer">
+      <!-- Uploaded files -->
+      <div v-if="uploadedFiles.length > 0" class="uploaded-files">
+        <div
+          v-for="(file, index) in uploadedFiles"
+          :key="index"
+          class="file-tag"
+        >
+          <span class="file-icon">📄</span>
+          <span class="file-name" :title="file.name">{{ file.name }}</span>
+          <span class="file-size">{{ formatFileSize(file.size) }}</span>
+          <button class="file-remove" @click="removeFile(index)">×</button>
+        </div>
+      </div>
+
       <div class="input-wrapper">
+        <!-- Hidden file input -->
+        <input
+          ref="fileInputRef"
+          type="file"
+          multiple
+          class="hidden-file-input"
+          @change="handleFileInput"
+        />
+
+        <!-- Upload button -->
+        <button
+          class="upload-btn"
+          @click="triggerFileUpload"
+          title="上传文件"
+        >
+          📎
+        </button>
+
         <input
           ref="inputRef"
           v-model="inputMessage"
@@ -789,6 +1153,7 @@ function getToolStatusIcon(status: string): string {
         <span class="hint-item">Tab: 自动补全</span>
         <span class="hint-item">↑↓: 历史记录</span>
         <span class="hint-item">Ctrl+C: 取消</span>
+        <span class="hint-item">拖拽上传文件</span>
       </div>
     </footer>
   </div>
@@ -1391,6 +1756,108 @@ function formatJson(json: string): string {
   color: #fff;
 }
 
+/* File Picker Popup */
+.file-picker-popup {
+  position: fixed;
+  bottom: 90px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(30, 30, 50, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  overflow: hidden;
+  z-index: 200;
+  min-width: 300px;
+  max-width: 500px;
+  max-height: 350px;
+  display: flex;
+  flex-direction: column;
+}
+
+.file-picker-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: rgba(102, 126, 234, 0.15);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.file-picker-icon {
+  font-size: 14px;
+}
+
+.file-search-input-wrapper {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.file-search-input {
+  width: 100%;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+}
+
+.file-search-input:focus {
+  border-color: #667eea;
+}
+
+.file-search-results {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 250px;
+}
+
+.file-search-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.file-search-item:hover,
+.file-search-item.selected {
+  background: rgba(102, 126, 234, 0.2);
+}
+
+.file-item-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.file-item-name {
+  color: #fff;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-item-path {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-left: auto;
+}
+
+.file-search-empty {
+  padding: 20px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 13px;
+}
+
 /* Footer */
 .chat-footer {
   padding: 12px 20px;
@@ -1466,6 +1933,119 @@ function formatJson(json: string): string {
   border-top-color: white;
   border-radius: 50%;
   animation: spin 1s linear infinite;
+}
+
+/* Upload button */
+.upload-btn {
+  width: 44px;
+  height: 44px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 50%;
+  font-size: 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.upload-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  transform: scale(1.05);
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+/* Uploaded files */
+.uploaded-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  max-width: 800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.file-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(102, 126, 234, 0.15);
+  border: 1px solid rgba(102, 126, 234, 0.3);
+  border-radius: 16px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.file-icon {
+  font-size: 12px;
+}
+
+.file-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-size {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 10px;
+}
+
+.file-remove {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0;
+  margin-left: 2px;
+  line-height: 1;
+}
+
+.file-remove:hover {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* Drag overlay */
+.drag-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(15, 15, 26, 0.95);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  border: 3px dashed rgba(102, 126, 234, 0.5);
+  border-radius: 12px;
+  margin: 10px;
+}
+
+.drag-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.drag-icon {
+  font-size: 48px;
+  opacity: 0.7;
+}
+
+.drag-text {
+  font-size: 16px;
+  font-weight: 500;
 }
 
 .tools-hint {
