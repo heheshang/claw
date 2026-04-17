@@ -1,0 +1,38 @@
+{
+  "model": null,
+  "env": {},
+  "providers": {
+    "anthropic": {
+      "api_key": "sk-cp-SCfnZZ5yJgN-_g6Ca0CYIQ7EndBa1F2cUdKB_ZKmAydVUr6Xqv2qzqbhvBwgnRibCmUEKk4HCNscKh64fktfzomEHSUvQ2nPw3RRhCgYMqbDPw5o1xfa4qk",
+      "base_url": "https://api.minimaxi.com/anthropic",
+      "model": "MiniMax-M2.7",
+      "max_tokens": 4096,
+      "temperature": 0.7,
+      "retry_count": 10,
+      "response_language": "中文"
+    },
+    "openai": {
+      "api_key": null,
+      "base_url": null,
+      "model": null,
+      "max_tokens": null,
+      "temperature": null,
+      "retry_count": 3,
+      "response_language": null
+    },
+    "xai": {
+      "api_key": null,
+      "base_url": null,
+      "model": null,
+      "max_tokens": null,
+      "temperature": null,
+      "retry_count": 3,
+      "response_language": null
+    }
+  },
+  "permissions": {
+    "allow_dangerous": false,
+    "allowed_dirs": []
+  },
+  "aliases": {}
+}

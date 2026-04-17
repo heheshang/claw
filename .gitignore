@@ -1,0 +1,62 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Claw config (contains API keys)
+.claw/settings.local.json
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri
+src-tauri/target
+src-tauri/.taurignore
+src-tauri/cargo.lock
+
+# Claude
+.claude/
+*.session.jsonl
+*.usage.jsonl
+
+# Rust
+target/
+Cargo.lock
+
+# Node
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build
+*.exe
+*.dll
+*.so
+*.dylib
+*.rlib
+
+# Test/Coverage
+coverage/
+*.profdata
